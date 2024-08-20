@@ -1,7 +1,6 @@
 
 /*
  * Copyright (C) Igor Sysoev
- * Copyright (C) Nginx, Inc.
  */
 
 
@@ -10,10 +9,8 @@
 #include <ngx_http.h>
 
 
-static ngx_int_t ngx_http_postpone_filter_add(ngx_http_request_t *r,
-    ngx_chain_t *in);
-static ngx_int_t ngx_http_postpone_filter_in_memory(ngx_http_request_t *r,
-    ngx_chain_t *in);
+static ngx_int_t
+    ngx_http_postpone_filter_output_postponed_request(ngx_http_request_t *r);
 static ngx_int_t ngx_http_postpone_filter_init(ngx_conf_t *cf);
 
 
@@ -48,201 +45,184 @@ ngx_module_t  ngx_http_postpone_filter_module = {
 };
 
 
-static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
+static ngx_http_output_body_filter_pt    ngx_http_next_filter;
 
 
 static ngx_int_t
 ngx_http_postpone_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
-    ngx_connection_t              *c;
-    ngx_http_postponed_request_t  *pr;
+    ngx_int_t                      rc;
+    ngx_chain_t                   *out;
+    ngx_http_postponed_request_t  *pr, **ppr;
 
-    c = r->connection;
-
-    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, c->log, 0,
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http postpone filter \"%V?%V\" %p", &r->uri, &r->args, in);
 
-    if (r->subrequest_in_memory) {
-        return ngx_http_postpone_filter_in_memory(r, in);
-    }
+    if (r != r->connection->data || (r->postponed && in)) {
 
-    if (r != c->data) {
+        if (r->postponed) {
+            for (pr = r->postponed; pr->next; pr = pr->next) { /* void */ }
 
-        if (in) {
-            if (ngx_http_postpone_filter_add(r, in) != NGX_OK) {
+            ppr = pr->request ? &pr->next : NULL;
+
+        } else {
+            ppr = &r->postponed;
+#if (NGX_SUPPRESS_WARN)
+            pr = NULL;
+#endif
+        }
+
+        if (ppr) {
+            pr = ngx_palloc(r->pool, sizeof(ngx_http_postponed_request_t));
+            if (pr == NULL) {
                 return NGX_ERROR;
             }
 
-            return NGX_OK;
+            *ppr = pr;
+
+            pr->request = NULL;
+            pr->out = NULL;
+            pr->next = NULL;
         }
 
-#if 0
-        /* TODO: SSI may pass NULL */
-        ngx_log_error(NGX_LOG_ALERT, c->log, 0,
-                      "http postpone filter NULL inactive request");
+        if (ngx_chain_add_copy(r->pool, &pr->out, in) == NGX_ERROR) {
+            return NGX_ERROR;
+        }
+
+#if 1
+        {
+        ngx_chain_t  *cl;
+        ngx_buf_t    *b = NULL;
+        for (cl = pr->out; cl; cl = cl->next) {
+            if (cl->buf == b) {
+                ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                              "the same buf was used in postponed %p %p",
+                               b, b->pos);
+                ngx_debug_point();
+                return NGX_ERROR;
+            }
+            b = cl->buf;
+        }
+        }
 #endif
 
-        return NGX_OK;
+        if (r != r->connection->data || r->postponed->request) {
+            return NGX_AGAIN;
+        }
+    }
+
+    if (r->postponed) {
+        out = r->postponed->out;
+        if (out) {
+            r->postponed = r->postponed->next;
+        }
+
+    } else {
+        out = in;
+    }
+
+    rc = NGX_OK;
+
+    if (out
+        || (r->connection->buffered
+            & (NGX_HTTP_LOWLEVEL_BUFFERED|NGX_LOWLEVEL_BUFFERED)))
+    {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "http postpone filter out \"%V?%V\"", &r->uri, &r->args);
+
+        if (!(out && out->next == NULL && ngx_buf_sync_only(out->buf))) {
+
+            rc = ngx_http_next_filter(r->main, out);
+
+            if (rc == NGX_ERROR) {
+                /* NGX_ERROR may be returned by any filter */
+                r->connection->error = 1;
+            }
+        }
     }
 
     if (r->postponed == NULL) {
-
-        if (in || c->buffered) {
-            return ngx_http_next_body_filter(r->main, in);
-        }
-
-        return NGX_OK;
+        return rc;
     }
 
-    if (in) {
-        if (ngx_http_postpone_filter_add(r, in) != NGX_OK) {
-            return NGX_ERROR;
-        }
+    rc = ngx_http_postpone_filter_output_postponed_request(r);
+
+    if (rc == NGX_ERROR) {
+        /* NGX_ERROR may be returned by any filter */
+        r->connection->error = 1;
     }
 
-    do {
+    return rc;
+}
+
+
+static ngx_int_t
+ngx_http_postpone_filter_output_postponed_request(ngx_http_request_t *r)
+{
+    ngx_int_t                      rc;
+    ngx_chain_t                   *out;
+    ngx_http_log_ctx_t            *ctx;
+    ngx_http_postponed_request_t  *pr;
+
+    for ( ;; ) {
         pr = r->postponed;
+
+        if (pr == NULL) {
+            break;
+        }
 
         if (pr->request) {
 
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                           "http postpone filter wake \"%V?%V\"",
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "http postpone filter handle \"%V?%V\"",
                            &pr->request->uri, &pr->request->args);
 
-            r->postponed = pr->next;
+            ctx = r->connection->log->data;
+            ctx->current_request = pr->request;
 
-            c->data = pr->request;
+            if (!pr->request->done) {
+                r->connection->data = pr->request;
+                return NGX_AGAIN;
+            }
 
-            return ngx_http_post_request(pr->request, NULL);
+            rc = ngx_http_postpone_filter_output_postponed_request(pr->request);
+
+            if (rc == NGX_AGAIN || rc == NGX_ERROR) {
+                return rc;
+            }
+
+            r->postponed = r->postponed->next;
+            pr = r->postponed;
         }
 
-        if (pr->out == NULL) {
-            ngx_log_error(NGX_LOG_ALERT, c->log, 0,
-                          "http postpone filter NULL output");
+        if (pr == NULL) {
+            break;
+        }
 
-        } else {
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                           "http postpone filter output \"%V?%V\"",
+        out = pr->out;
+
+        if (out) {
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "http postpone filter out postponed \"%V?%V\"",
                            &r->uri, &r->args);
 
-            if (ngx_http_next_body_filter(r->main, pr->out) == NGX_ERROR) {
-                return NGX_ERROR;
+            if (!(out && out->next == NULL && ngx_buf_sync_only(out->buf))) {
+                if (ngx_http_next_filter(r->main, out) == NGX_ERROR) {
+                    return NGX_ERROR;
+                }
             }
         }
 
-        r->postponed = pr->next;
-
-    } while (r->postponed);
-
-    return NGX_OK;
-}
-
-
-static ngx_int_t
-ngx_http_postpone_filter_add(ngx_http_request_t *r, ngx_chain_t *in)
-{
-    ngx_http_postponed_request_t  *pr, **ppr;
-
-    if (r->postponed) {
-        for (pr = r->postponed; pr->next; pr = pr->next) { /* void */ }
-
-        if (pr->request == NULL) {
-            goto found;
-        }
-
-        ppr = &pr->next;
-
-    } else {
-        ppr = &r->postponed;
+        r->postponed = r->postponed->next;
     }
 
-    pr = ngx_palloc(r->pool, sizeof(ngx_http_postponed_request_t));
-    if (pr == NULL) {
-        return NGX_ERROR;
-    }
+    if (r != r->main && r->out) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "http postpone filter out again \"%V?%V\"",
+                       &r->uri, &r->args);
 
-    *ppr = pr;
-
-    pr->request = NULL;
-    pr->out = NULL;
-    pr->next = NULL;
-
-found:
-
-    if (ngx_chain_add_copy(r->pool, &pr->out, in) == NGX_OK) {
-        return NGX_OK;
-    }
-
-    return NGX_ERROR;
-}
-
-
-static ngx_int_t
-ngx_http_postpone_filter_in_memory(ngx_http_request_t *r, ngx_chain_t *in)
-{
-    size_t                     len;
-    ngx_buf_t                 *b;
-    ngx_connection_t          *c;
-    ngx_http_core_loc_conf_t  *clcf;
-
-    c = r->connection;
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                   "http postpone filter in memory");
-
-    if (r->out == NULL) {
-        clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
-
-        if (r->headers_out.content_length_n != -1) {
-            len = r->headers_out.content_length_n;
-
-            if (len > clcf->subrequest_output_buffer_size) {
-                ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                              "too big subrequest response: %uz", len);
-                return NGX_ERROR;
-            }
-
-        } else {
-            len = clcf->subrequest_output_buffer_size;
-        }
-
-        b = ngx_create_temp_buf(r->pool, len);
-        if (b == NULL) {
-            return NGX_ERROR;
-        }
-
-        b->last_buf = 1;
-
-        r->out = ngx_alloc_chain_link(r->pool);
-        if (r->out == NULL) {
-            return NGX_ERROR;
-        }
-
-        r->out->buf = b;
-        r->out->next = NULL;
-    }
-
-    b = r->out->buf;
-
-    for ( /* void */ ; in; in = in->next) {
-
-        if (ngx_buf_special(in->buf)) {
-            continue;
-        }
-
-        len = in->buf->last - in->buf->pos;
-
-        if (len > (size_t) (b->end - b->last)) {
-            ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                          "too big subrequest response");
-            return NGX_ERROR;
-        }
-
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                       "http postpone filter in memory %uz bytes", len);
-
-        b->last = ngx_cpymem(b->last, in->buf->pos, len);
-        in->buf->pos = in->buf->last;
+        r->connection->data = r;
+        return NGX_AGAIN;
     }
 
     return NGX_OK;
@@ -252,7 +232,7 @@ ngx_http_postpone_filter_in_memory(ngx_http_request_t *r, ngx_chain_t *in)
 static ngx_int_t
 ngx_http_postpone_filter_init(ngx_conf_t *cf)
 {
-    ngx_http_next_body_filter = ngx_http_top_body_filter;
+    ngx_http_next_filter = ngx_http_top_body_filter;
     ngx_http_top_body_filter = ngx_http_postpone_filter;
 
     return NGX_OK;

@@ -1,7 +1,6 @@
 
 /*
  * Copyright (C) Igor Sysoev
- * Copyright (C) Nginx, Inc.
  */
 
 
@@ -9,6 +8,8 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+
+#define NGX_HTTP_DAV_COPY_BLOCK      65536
 
 #define NGX_HTTP_DAV_OFF             2
 
@@ -52,11 +53,13 @@ static ngx_int_t ngx_http_dav_copy_dir_time(ngx_tree_ctx_t *ctx,
     ngx_str_t *path);
 static ngx_int_t ngx_http_dav_copy_tree_file(ngx_tree_ctx_t *ctx,
     ngx_str_t *path);
+static ngx_int_t ngx_http_dav_copy_file(ngx_tree_ctx_t *ctx, u_char *from,
+    u_char *to);
 
 static ngx_int_t ngx_http_dav_depth(ngx_http_request_t *r, ngx_int_t dflt);
 static ngx_int_t ngx_http_dav_error(ngx_log_t *log, ngx_err_t err,
     ngx_int_t not_found, char *failed, u_char *path);
-static ngx_int_t ngx_http_dav_location(ngx_http_request_t *r);
+static ngx_int_t ngx_http_dav_location(ngx_http_request_t *r, u_char *path);
 static void *ngx_http_dav_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_dav_merge_loc_conf(ngx_conf_t *cf,
     void *parent, void *child);
@@ -145,6 +148,11 @@ ngx_http_dav_handler(ngx_http_request_t *r)
     ngx_int_t                 rc;
     ngx_http_dav_loc_conf_t  *dlcf;
 
+    /* TODO: Win32 */
+    if (r->zero_in_uri) {
+        return NGX_DECLINED;
+    }
+
     dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
 
     if (!(r->method & dlcf->methods)) {
@@ -157,14 +165,8 @@ ngx_http_dav_handler(ngx_http_request_t *r)
 
         if (r->uri.data[r->uri.len - 1] == '/') {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                          "cannot PUT to a collection");
+                          "can not PUT to a collection");
             return NGX_HTTP_CONFLICT;
-        }
-
-        if (r->headers_in.content_range) {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                          "PUT with range is unsupported");
-            return NGX_HTTP_NOT_IMPLEMENTED;
         }
 
         r->request_body_in_file_only = 1;
@@ -213,33 +215,14 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
     ngx_ext_rename_file_t     ext;
     ngx_http_dav_loc_conf_t  *dlcf;
 
-    if (r->request_body == NULL) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "PUT request body is unavailable");
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
-    }
-
-    if (r->request_body->temp_file == NULL) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "PUT request body must be in a file");
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
-    }
-
-    if (ngx_http_map_uri_to_path(r, &path, &root, 0) == NULL) {
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
-    }
-
-    path.len--;
+    ngx_http_map_uri_to_path(r, &path, &root, 0);
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http put filename: \"%s\"", path.data);
 
     temp = &r->request_body->temp_file->file.name;
 
-    if (ngx_file_info(path.data, &fi) == NGX_FILE_ERROR) {
+    if (ngx_file_info(path.data, &fi) == -1) {
         status = NGX_HTTP_CREATED;
 
     } else {
@@ -263,14 +246,13 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
     dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
 
     ext.access = dlcf->access;
-    ext.path_access = dlcf->access;
     ext.time = -1;
     ext.create_path = dlcf->create_full_put_path;
     ext.delete_file = 1;
     ext.log = r->connection->log;
 
     if (r->headers_in.date) {
-        date = ngx_parse_http_time(r->headers_in.date->value.data,
+        date = ngx_http_parse_time(r->headers_in.date->value.data,
                                    r->headers_in.date->value.len);
 
         if (date != NGX_ERROR) {
@@ -285,7 +267,7 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
     }
 
     if (status == NGX_HTTP_CREATED) {
-        if (ngx_http_dav_location(r) != NGX_OK) {
+        if (ngx_http_dav_location(r, path.data) != NGX_OK) {
             ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
             return;
         }
@@ -312,7 +294,7 @@ ngx_http_dav_delete_handler(ngx_http_request_t *r)
     ngx_file_info_t           fi;
     ngx_http_dav_loc_conf_t  *dlcf;
 
-    if (r->headers_in.content_length_n > 0 || r->headers_in.chunked) {
+    if (r->headers_in.content_length_n > 0) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "DELETE with body is unsupported");
         return NGX_HTTP_UNSUPPORTED_MEDIA_TYPE;
@@ -338,20 +320,18 @@ ngx_http_dav_delete_handler(ngx_http_request_t *r)
 
 ok:
 
-    if (ngx_http_map_uri_to_path(r, &path, &root, 0) == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
+    ngx_http_map_uri_to_path(r, &path, &root, 0);
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http delete filename: \"%s\"", path.data);
 
-    if (ngx_link_info(path.data, &fi) == NGX_FILE_ERROR) {
+    if (ngx_file_info(path.data, &fi) == -1) {
         err = ngx_errno;
 
         rc = (err == NGX_ENOTDIR) ? NGX_HTTP_CONFLICT : NGX_HTTP_NOT_FOUND;
 
         return ngx_http_dav_error(r->connection->log, err,
-                                  rc, ngx_link_info_n, path.data);
+                                  rc, ngx_file_info_n, path.data);
     }
 
     if (ngx_is_dir(&fi)) {
@@ -378,7 +358,7 @@ ok:
 
         /*
          * we do not need to test (r->uri.data[r->uri.len - 1] == '/')
-         * because ngx_link_info("/file/") returned NGX_ENOTDIR above
+         * because ngx_file_info("/file/") returned NGX_ENOTDIR above
          */
 
         depth = ngx_http_dav_depth(r, 0);
@@ -495,7 +475,7 @@ ngx_http_dav_mkcol_handler(ngx_http_request_t *r, ngx_http_dav_loc_conf_t *dlcf)
     size_t     root;
     ngx_str_t  path;
 
-    if (r->headers_in.content_length_n > 0 || r->headers_in.chunked) {
+    if (r->headers_in.content_length_n > 0) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "MKCOL with body is unsupported");
         return NGX_HTTP_UNSUPPORTED_MEDIA_TYPE;
@@ -508,9 +488,6 @@ ngx_http_dav_mkcol_handler(ngx_http_request_t *r, ngx_http_dav_loc_conf_t *dlcf)
     }
 
     p = ngx_http_map_uri_to_path(r, &path, &root, 0);
-    if (p == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
 
     *(p - 1) = '\0';
 
@@ -520,7 +497,7 @@ ngx_http_dav_mkcol_handler(ngx_http_request_t *r, ngx_http_dav_loc_conf_t *dlcf)
     if (ngx_create_dir(path.data, ngx_dir_access(dlcf->access))
         != NGX_FILE_ERROR)
     {
-        if (ngx_http_dav_location(r) != NGX_OK) {
+        if (ngx_http_dav_location(r, path.data) != NGX_OK) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
 
@@ -539,19 +516,15 @@ ngx_http_dav_copy_move_handler(ngx_http_request_t *r)
     size_t                    len, root;
     ngx_err_t                 err;
     ngx_int_t                 rc, depth;
-    ngx_uint_t                overwrite, slash, dir, flags;
-    ngx_str_t                 path, uri, duri, args;
+    ngx_uint_t                overwrite, slash, dir;
+    ngx_str_t                 path, uri;
     ngx_tree_ctx_t            tree;
-    ngx_copy_file_t           cf;
     ngx_file_info_t           fi;
     ngx_table_elt_t          *dest, *over;
-    ngx_ext_rename_file_t     ext;
     ngx_http_dav_copy_ctx_t   copy;
     ngx_http_dav_loc_conf_t  *dlcf;
 
-    if (r->headers_in.content_length_n > 0 || r->headers_in.chunked) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "COPY and MOVE with body are unsupported");
+    if (r->headers_in.content_length_n > 0) {
         return NGX_HTTP_UNSUPPORTED_MEDIA_TYPE;
     }
 
@@ -561,13 +534,6 @@ ngx_http_dav_copy_move_handler(ngx_http_request_t *r)
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "client sent no \"Destination\" header");
         return NGX_HTTP_BAD_REQUEST;
-    }
-
-    p = dest->value.data;
-    /* there is always '\0' even after empty header value */
-    if (p[0] == '/') {
-        last = p + dest->value.len;
-        goto destination_done;
     }
 
     len = r->headers_in.server.len;
@@ -626,22 +592,14 @@ invalid_destination:
 
 destination_done:
 
-    duri.len = last - p;
-    duri.data = p;
-    flags = NGX_HTTP_LOG_UNSAFE;
-
-    if (ngx_http_parse_unsafe_uri(r, &duri, &args, &flags) != NGX_OK) {
-        goto invalid_destination;
-    }
-
     if ((r->uri.data[r->uri.len - 1] == '/' && *(last - 1) != '/')
         || (r->uri.data[r->uri.len - 1] != '/' && *(last - 1) == '/'))
     {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "both URI \"%V\" and \"Destination\" URI \"%V\" "
-                      "should be either collections or non-collections",
-                      &r->uri, &dest->value);
-        return NGX_HTTP_CONFLICT;
+         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                       "both URI \"%V\" and \"Destination\" URI \"%V\" "
+                       "should be either collections or non-collections",
+                       &r->uri, &dest->value);
+         return NGX_HTTP_CONFLICT;
     }
 
     depth = ngx_http_dav_depth(r, NGX_HTTP_DAV_INFINITY_DEPTH);
@@ -690,19 +648,17 @@ destination_done:
 
 overwrite_done:
 
-    if (ngx_http_map_uri_to_path(r, &path, &root, 0) == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
+    ngx_http_map_uri_to_path(r, &path, &root, 0);
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http copy from: \"%s\"", path.data);
 
     uri = r->uri;
-    r->uri = duri;
 
-    if (ngx_http_map_uri_to_path(r, &copy.path, &root, 0) == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
+    r->uri.len = last - p;
+    r->uri.data = p;
+
+    ngx_http_map_uri_to_path(r, &copy.path, &root, 0);
 
     r->uri = uri;
 
@@ -720,12 +676,12 @@ overwrite_done:
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http copy to: \"%s\"", copy.path.data);
 
-    if (ngx_link_info(copy.path.data, &fi) == NGX_FILE_ERROR) {
+    if (ngx_file_info(copy.path.data, &fi) == -1) {
         err = ngx_errno;
 
         if (err != NGX_ENOENT) {
             return ngx_http_dav_error(r->connection->log, err,
-                                      NGX_HTTP_NOT_FOUND, ngx_link_info_n,
+                                      NGX_HTTP_NOT_FOUND, ngx_file_info_n,
                                       copy.path.data);
         }
 
@@ -754,9 +710,9 @@ overwrite_done:
         dir = ngx_is_dir(&fi);
     }
 
-    if (ngx_link_info(path.data, &fi) == NGX_FILE_ERROR) {
+    if (ngx_file_info(path.data, &fi) == -1) {
         return ngx_http_dav_error(r->connection->log, ngx_errno,
-                                  NGX_HTTP_NOT_FOUND, ngx_link_info_n,
+                                  NGX_HTTP_NOT_FOUND, ngx_file_info_n,
                                   path.data);
     }
 
@@ -825,30 +781,28 @@ overwrite_done:
     } else {
 
         if (r->method == NGX_HTTP_MOVE) {
-
-            dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
-
-            ext.access = 0;
-            ext.path_access = dlcf->access;
-            ext.time = -1;
-            ext.create_path = 1;
-            ext.delete_file = 0;
-            ext.log = r->connection->log;
-
-            if (ngx_ext_rename_file(&path, &copy.path, &ext) == NGX_OK) {
+            if (ngx_rename_file(path.data, copy.path.data) != NGX_FILE_ERROR) {
                 return NGX_HTTP_NO_CONTENT;
             }
-
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
 
-        cf.size = ngx_file_size(&fi);
-        cf.buf_size = 0;
-        cf.access = ngx_file_access(&fi);
-        cf.time = ngx_file_mtime(&fi);
-        cf.log = r->connection->log;
+        dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
 
-        if (ngx_copy_file(path.data, copy.path.data, &cf) == NGX_OK) {
+        tree.size = ngx_file_size(&fi);
+        tree.mtime = ngx_file_mtime(&fi);
+        tree.access = dlcf->access;
+        tree.log = r->connection->log;
+
+        if (ngx_http_dav_copy_file(&tree, path.data, copy.path.data) == NGX_OK)
+        {
+            if (r->method == NGX_HTTP_MOVE) {
+                rc = ngx_http_dav_delete_path(r, &path, 0);
+
+                if (rc != NGX_OK) {
+                    return rc;
+                }
+            }
+
             return NGX_HTTP_NO_CONTENT;
         }
     }
@@ -962,7 +916,6 @@ ngx_http_dav_copy_tree_file(ngx_tree_ctx_t *ctx, ngx_str_t *path)
 {
     u_char                   *p, *file;
     size_t                    len;
-    ngx_copy_file_t           cf;
     ngx_http_dav_copy_ctx_t  *copy;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->log, 0,
@@ -983,17 +936,80 @@ ngx_http_dav_copy_tree_file(ngx_tree_ctx_t *ctx, ngx_str_t *path)
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->log, 0,
                    "http copy file to: \"%s\"", file);
 
-    cf.size = ctx->size;
-    cf.buf_size = 0;
-    cf.access = ctx->access;
-    cf.time = ctx->mtime;
-    cf.log = ctx->log;
-
-    (void) ngx_copy_file(path->data, file, &cf);
+    (void) ngx_http_dav_copy_file(ctx, path->data, file);
 
     ngx_free(file);
 
     return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_dav_copy_file(ngx_tree_ctx_t *ctx, u_char *from, u_char *to)
+{
+    off_t       size;
+    ssize_t     n;
+    ngx_fd_t    fd, cfd;
+    ngx_int_t   rc;
+    u_char      buf[NGX_HTTP_DAV_COPY_BLOCK];
+
+    fd = ngx_open_file(from, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+
+    if (fd == NGX_INVALID_FILE) {
+        (void) ngx_http_dav_error(ctx->log, ngx_errno, 0, ngx_open_file_n,
+                                  from);
+        return NGX_ERROR;
+    }
+
+    cfd = ngx_open_file(to, NGX_FILE_WRONLY, NGX_FILE_CREATE_OR_OPEN,
+                        ctx->access);
+
+    rc = NGX_ERROR;
+
+    if (cfd == NGX_INVALID_FILE) {
+        (void) ngx_http_dav_error(ctx->log, ngx_errno, 0, ngx_open_file_n, to);
+        goto failed;
+    }
+
+    for (size = ctx->size; size > 0; size -= n) {
+
+        n = ngx_read_fd(fd, buf, NGX_HTTP_DAV_COPY_BLOCK);
+
+        if (n == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_ALERT, ctx->log, ngx_errno,
+                          ngx_read_fd_n " \"%s\" failed", from);
+            goto failed;
+        }
+
+        if (ngx_write_fd(cfd, buf, n) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_ALERT, ctx->log, ngx_errno,
+                          ngx_write_fd_n " \"%s\" failed", to);
+            goto failed;
+        }
+    }
+
+    if (ngx_set_file_time(to, cfd, ctx->mtime) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ALERT, ctx->log, ngx_errno,
+                      ngx_set_file_time_n " \"%s\" failed", to);
+        goto failed;
+    }
+
+    if (ngx_close_file(cfd) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ALERT, ctx->log, ngx_errno,
+                      ngx_close_file_n " \"%s\" failed", to);
+        goto failed;
+    }
+
+    rc = NGX_OK;
+
+failed:
+
+    if (ngx_close_file(fd) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ALERT, ctx->log, ngx_errno,
+                      ngx_close_file_n " \"%s\" failed", from);
+    }
+
+    return rc;
 }
 
 
@@ -1070,40 +1086,37 @@ ngx_http_dav_error(ngx_log_t *log, ngx_err_t err, ngx_int_t not_found,
 
 
 static ngx_int_t
-ngx_http_dav_location(ngx_http_request_t *r)
+ngx_http_dav_location(ngx_http_request_t *r, u_char *path)
 {
-    u_char     *p;
-    size_t      len;
-    uintptr_t   escape;
+    u_char                    *location;
+    ngx_http_core_loc_conf_t  *clcf;
 
-    r->headers_out.location = ngx_list_push(&r->headers_out.headers);
+    r->headers_out.location = ngx_palloc(r->pool, sizeof(ngx_table_elt_t));
     if (r->headers_out.location == NULL) {
         return NGX_ERROR;
     }
 
-    r->headers_out.location->hash = 1;
-    r->headers_out.location->next = NULL;
-    ngx_str_set(&r->headers_out.location->key, "Location");
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
-    escape = 2 * ngx_escape_uri(NULL, r->uri.data, r->uri.len, NGX_ESCAPE_URI);
+    if (!clcf->alias && clcf->root_lengths == NULL) {
+        location = path + clcf->root.len;
 
-    if (escape) {
-        len = r->uri.len + escape;
-
-        p = ngx_pnalloc(r->pool, len);
-        if (p == NULL) {
-            ngx_http_clear_location(r);
+    } else {
+        location = ngx_palloc(r->pool, r->uri.len);
+        if (location == NULL) {
             return NGX_ERROR;
         }
 
-        r->headers_out.location->value.len = len;
-        r->headers_out.location->value.data = p;
-
-        ngx_escape_uri(p, r->uri.data, r->uri.len, NGX_ESCAPE_URI);
-
-    } else {
-        r->headers_out.location->value = r->uri;
+        ngx_memcpy(location, r->uri.data, r->uri.len);
     }
+
+    /*
+     * we do not need to set the r->headers_out.location->hash and
+     * r->headers_out.location->key fields
+     */
+
+    r->headers_out.location->value.len = r->uri.len;
+    r->headers_out.location->value.data = location;
 
     return NGX_OK;
 }
@@ -1116,7 +1129,7 @@ ngx_http_dav_create_loc_conf(ngx_conf_t *cf)
 
     conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_dav_loc_conf_t));
     if (conf == NULL) {
-        return NULL;
+        return NGX_CONF_ERROR;
     }
 
     /*

@@ -1,7 +1,6 @@
 
 /*
  * Copyright (C) Igor Sysoev
- * Copyright (C) Nginx, Inc.
  */
 
 
@@ -14,7 +13,7 @@ static ngx_int_t ngx_http_static_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_static_init(ngx_conf_t *cf);
 
 
-static ngx_http_module_t  ngx_http_static_module_ctx = {
+ngx_http_module_t  ngx_http_static_module_ctx = {
     NULL,                                  /* preconfiguration */
     ngx_http_static_init,                  /* postconfiguration */
 
@@ -50,7 +49,6 @@ ngx_http_static_handler(ngx_http_request_t *r)
 {
     u_char                    *last, *location;
     size_t                     root, len;
-    uintptr_t                  escape;
     ngx_str_t                  path;
     ngx_int_t                  rc;
     ngx_uint_t                 level;
@@ -65,6 +63,11 @@ ngx_http_static_handler(ngx_http_request_t *r)
     }
 
     if (r->uri.data[r->uri.len - 1] == '/') {
+        return NGX_DECLINED;
+    }
+
+    /* TODO: Win32 */
+    if (r->zero_in_uri) {
         return NGX_DECLINED;
     }
 
@@ -87,18 +90,11 @@ ngx_http_static_handler(ngx_http_request_t *r)
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
-    ngx_memzero(&of, sizeof(ngx_open_file_info_t));
-
-    of.read_ahead = clcf->read_ahead;
-    of.directio = clcf->directio;
+    of.test_dir = 0;
     of.valid = clcf->open_file_cache_valid;
     of.min_uses = clcf->open_file_cache_min_uses;
     of.errors = clcf->open_file_cache_errors;
     of.events = clcf->open_file_cache_events;
-
-    if (ngx_http_set_disable_symlinks(r, clcf, &path, &of) != NGX_OK) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
 
     if (ngx_open_cached_file(clcf->open_file_cache, &path, &of, r->pool)
         != NGX_OK)
@@ -117,10 +113,6 @@ ngx_http_static_handler(ngx_http_request_t *r)
             break;
 
         case NGX_EACCES:
-#if (NGX_HAVE_OPENAT)
-        case NGX_EMLINK:
-        case NGX_ELOOP:
-#endif
 
             level = NGX_LOG_ERR;
             rc = NGX_HTTP_FORBIDDEN;
@@ -135,13 +127,11 @@ ngx_http_static_handler(ngx_http_request_t *r)
 
         if (rc != NGX_HTTP_NOT_FOUND || clcf->log_not_found) {
             ngx_log_error(level, log, of.err,
-                          "%s \"%s\" failed", of.failed, path.data);
+                          ngx_open_file_n " \"%s\" failed", path.data);
         }
 
         return rc;
     }
-
-    r->root_tested = !r->error_page;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0, "http static fd: %d", of.fd);
 
@@ -149,42 +139,29 @@ ngx_http_static_handler(ngx_http_request_t *r)
 
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, log, 0, "http dir");
 
-        ngx_http_clear_location(r);
-
-        r->headers_out.location = ngx_list_push(&r->headers_out.headers);
+        r->headers_out.location = ngx_palloc(r->pool, sizeof(ngx_table_elt_t));
         if (r->headers_out.location == NULL) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
 
-        escape = 2 * ngx_escape_uri(NULL, r->uri.data, r->uri.len,
-                                    NGX_ESCAPE_URI);
+        len = r->uri.len + 1;
 
-        if (!clcf->alias && r->args.len == 0 && escape == 0) {
-            len = r->uri.len + 1;
-            location = path.data + root;
+        if (!clcf->alias && clcf->root_lengths == NULL && r->args.len == 0) {
+            location = path.data + clcf->root.len;
 
             *last = '/';
 
         } else {
-            len = r->uri.len + escape + 1;
-
             if (r->args.len) {
                 len += r->args.len + 1;
             }
 
-            location = ngx_pnalloc(r->pool, len);
+            location = ngx_palloc(r->pool, len);
             if (location == NULL) {
-                ngx_http_clear_location(r);
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
 
-            if (escape) {
-                last = (u_char *) ngx_escape_uri(location, r->uri.data,
-                                                 r->uri.len, NGX_ESCAPE_URI);
-
-            } else {
-                last = ngx_copy(location, r->uri.data, r->uri.len);
-            }
+            last = ngx_copy(location, r->uri.data, r->uri.len);
 
             *last = '/';
 
@@ -194,9 +171,11 @@ ngx_http_static_handler(ngx_http_request_t *r)
             }
         }
 
-        r->headers_out.location->hash = 1;
-        r->headers_out.location->next = NULL;
-        ngx_str_set(&r->headers_out.location->key, "Location");
+        /*
+         * we do not need to set the r->headers_out.location->hash and
+         * r->headers_out.location->key fields
+         */
+
         r->headers_out.location->value.len = len;
         r->headers_out.location->value.data = location;
 
@@ -206,7 +185,7 @@ ngx_http_static_handler(ngx_http_request_t *r)
 #if !(NGX_WIN32) /* the not regular files are probably Unix specific */
 
     if (!of.is_file) {
-        ngx_log_error(NGX_LOG_CRIT, log, 0,
+        ngx_log_error(NGX_LOG_CRIT, log, ngx_errno,
                       "\"%s\" is not a regular file", path.data);
 
         return NGX_HTTP_NOT_FOUND;
@@ -214,7 +193,7 @@ ngx_http_static_handler(ngx_http_request_t *r)
 
 #endif
 
-    if (r->method == NGX_HTTP_POST) {
+    if (r->method & NGX_HTTP_POST) {
         return NGX_HTTP_NOT_ALLOWED;
     }
 
@@ -230,19 +209,19 @@ ngx_http_static_handler(ngx_http_request_t *r)
     r->headers_out.content_length_n = of.size;
     r->headers_out.last_modified_time = of.mtime;
 
-    if (ngx_http_set_etag(r) != NGX_OK) {
+    if (ngx_http_set_content_type(r) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    if (ngx_http_set_content_type(r) != NGX_OK) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    if (r != r->main && of.size == 0) {
+        return ngx_http_send_header(r);
     }
 
     r->allow_ranges = 1;
 
     /* we need to allocate all before the header would be sent */
 
-    b = ngx_calloc_buf(r->pool);
+    b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
     if (b == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
@@ -261,15 +240,13 @@ ngx_http_static_handler(ngx_http_request_t *r)
     b->file_pos = 0;
     b->file_last = of.size;
 
-    b->in_file = b->file_last ? 1 : 0;
-    b->last_buf = (r == r->main) ? 1 : 0;
+    b->in_file = b->file_last ? 1: 0;
+    b->last_buf = (r == r->main) ? 1: 0;
     b->last_in_chain = 1;
-    b->sync = (b->last_buf || b->in_file) ? 0 : 1;
 
     b->file->fd = of.fd;
     b->file->name = path;
     b->file->log = log;
-    b->file->directio = of.is_directio;
 
     out.buf = b;
     out.next = NULL;

@@ -1,7 +1,6 @@
 
 /*
  * Copyright (C) Igor Sysoev
- * Copyright (C) Nginx, Inc.
  */
 
 
@@ -12,20 +11,11 @@
 #if (NGX_HPUX)
 #define _XOPEN_SOURCE
 #define _XOPEN_SOURCE_EXTENDED  1
-#define _HPUX_ALT_XOPEN_SOCKET_API
 #endif
 
 
 #if (NGX_TRU64)
 #define _REENTRANT
-#endif
-
-
-#if (NGX_GNU_HURD)
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE             /* accept4() */
-#endif
-#define _FILE_OFFSET_BITS       64
 #endif
 
 
@@ -47,7 +37,6 @@
 #include <stddef.h>             /* offsetof() */
 #include <stdio.h>
 #include <stdlib.h>
-#include <ctype.h>
 #include <errno.h>
 #include <string.h>
 #include <signal.h>
@@ -55,16 +44,6 @@
 #include <grp.h>
 #include <dirent.h>
 #include <glob.h>
-#include <time.h>
-#if (NGX_HAVE_SYS_PARAM_H)
-#include <sys/param.h>          /* statfs() */
-#endif
-#if (NGX_HAVE_SYS_MOUNT_H)
-#include <sys/mount.h>          /* statfs() */
-#endif
-#if (NGX_HAVE_SYS_STATVFS_H)
-#include <sys/statvfs.h>        /* statvfs() */
-#endif
 
 #if (NGX_HAVE_SYS_FILIO_H)
 #include <sys/filio.h>          /* FIONBIO */
@@ -108,16 +87,6 @@
 #include <ngx_auto_config.h>
 
 
-#if (NGX_HAVE_DLOPEN)
-#include <dlfcn.h>
-#endif
-
-
-#if (NGX_HAVE_POSIX_SEM)
-#include <semaphore.h>
-#endif
-
-
 #if (NGX_HAVE_POLL)
 #include <poll.h>
 #endif
@@ -128,21 +97,33 @@
 #endif
 
 
-#if (NGX_HAVE_DEVPOLL) && !(NGX_TEST_BUILD_DEVPOLL)
+#if (NGX_HAVE_DEVPOLL)
 #include <sys/ioctl.h>
 #include <sys/devpoll.h>
 #endif
 
 
-#if (NGX_HAVE_FILE_AIO)
-#include <aio.h>
-typedef struct aiocb  ngx_aiocb_t;
-#endif
-
-
 #define NGX_LISTEN_BACKLOG  511
 
-#define ngx_debug_init()
+
+#if (__FreeBSD__) && (__FreeBSD_version < 400017)
+
+#include <sys/param.h>          /* ALIGN() */
+
+/*
+ * FreeBSD 3.x has no CMSG_SPACE() and CMSG_LEN() and has the broken CMSG_DATA()
+ */
+
+#undef  CMSG_SPACE
+#define CMSG_SPACE(l)       (ALIGN(sizeof(struct cmsghdr)) + ALIGN(l))
+
+#undef  CMSG_LEN
+#define CMSG_LEN(l)         (ALIGN(sizeof(struct cmsghdr)) + (l))
+
+#undef  CMSG_DATA
+#define CMSG_DATA(cmsg)     ((u_char *)(cmsg) + ALIGN(sizeof(struct cmsghdr)))
+
+#endif
 
 
 extern char **environ;

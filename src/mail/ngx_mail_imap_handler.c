@@ -1,7 +1,6 @@
 
 /*
  * Copyright (C) Igor Sysoev
- * Copyright (C) Nginx, Inc.
  */
 
 
@@ -40,13 +39,14 @@ ngx_mail_imap_init_session(ngx_mail_session_t *s, ngx_connection_t *c)
 
     cscf = ngx_mail_get_module_srv_conf(s, ngx_mail_core_module);
 
-    ngx_str_set(&s->out, imap_greeting);
+    s->out.len = sizeof(imap_greeting) - 1;
+    s->out.data = imap_greeting;
 
     c->read->handler = ngx_mail_imap_init_protocol;
 
     ngx_add_timer(c->read, cscf->timeout);
 
-    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+    if (ngx_handle_read_event(c->read, 0) == NGX_ERROR) {
         ngx_mail_close_connection(c);
     }
 
@@ -101,9 +101,10 @@ ngx_mail_imap_init_protocol(ngx_event_t *rev)
 void
 ngx_mail_imap_auth_state(ngx_event_t *rev)
 {
-    u_char              *p;
+    u_char              *p, *dst, *src, *end;
+    ngx_str_t           *arg;
     ngx_int_t            rc;
-    ngx_uint_t           tag;
+    ngx_uint_t           tag, i;
     ngx_connection_t    *c;
     ngx_mail_session_t  *s;
 
@@ -122,12 +123,6 @@ ngx_mail_imap_auth_state(ngx_event_t *rev)
     if (s->out.len) {
         ngx_log_debug0(NGX_LOG_DEBUG_MAIL, c->log, 0, "imap send handler busy");
         s->blocked = 1;
-
-        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-            ngx_mail_close_connection(c);
-            return;
-        }
-
         return;
     }
 
@@ -135,27 +130,40 @@ ngx_mail_imap_auth_state(ngx_event_t *rev)
 
     rc = ngx_mail_read_command(s, c);
 
-    if (rc == NGX_AGAIN) {
-        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-            ngx_mail_session_internal_server_error(s);
-            return;
-        }
-
-        return;
-    }
-
-    if (rc == NGX_ERROR) {
+    if (rc == NGX_AGAIN || rc == NGX_ERROR) {
         return;
     }
 
     tag = 1;
     s->text.len = 0;
-    ngx_str_set(&s->out, imap_ok);
+    s->out.len = sizeof(imap_ok) - 1;
+    s->out.data = imap_ok;
 
     if (rc == NGX_OK) {
 
         ngx_log_debug1(NGX_LOG_DEBUG_MAIL, c->log, 0, "imap auth command: %i",
                        s->command);
+
+        if (s->backslash) {
+
+            arg = s->args.elts;
+
+            for (i = 0; i < s->args.nelts; i++) {
+                dst = arg[i].data;
+                end = dst + arg[i].len;
+
+                for (src = dst; src < end; dst++) {
+                    *dst = *src;
+                    if (*src++ == '\\') {
+                        *dst = *src++;
+                    }
+                }
+
+                arg[i].len = dst - arg[i].data;
+            }
+
+            s->backslash = 0;
+        }
 
         switch (s->mail_state) {
 
@@ -178,7 +186,8 @@ ngx_mail_imap_auth_state(ngx_event_t *rev)
 
             case NGX_IMAP_LOGOUT:
                 s->quit = 1;
-                ngx_str_set(&s->text, imap_bye);
+                s->text.len = sizeof(imap_bye) - 1;
+                s->text.data = imap_bye;
                 break;
 
             case NGX_IMAP_NOOP:
@@ -199,7 +208,8 @@ ngx_mail_imap_auth_state(ngx_event_t *rev)
             rc = ngx_mail_auth_login_username(s, c, 0);
 
             tag = 0;
-            ngx_str_set(&s->out, imap_password);
+            s->out.len = sizeof(imap_password) - 1;
+            s->out.data = imap_password;
             s->mail_state = ngx_imap_auth_login_password;
 
             break;
@@ -215,19 +225,12 @@ ngx_mail_imap_auth_state(ngx_event_t *rev)
         case ngx_imap_auth_cram_md5:
             rc = ngx_mail_auth_cram_md5(s, c);
             break;
-
-        case ngx_imap_auth_external:
-            rc = ngx_mail_auth_external(s, c, 0);
-            break;
         }
 
     } else if (rc == NGX_IMAP_NEXT) {
         tag = 0;
-        ngx_str_set(&s->out, imap_next);
-    }
-
-    if (s->buffer->pos < s->buffer->last) {
-        s->blocked = 1;
+        s->out.len = sizeof(imap_next) - 1;
+        s->out.data = imap_next;
     }
 
     switch (rc) {
@@ -242,19 +245,21 @@ ngx_mail_imap_auth_state(ngx_event_t *rev)
 
     case NGX_MAIL_PARSE_INVALID_COMMAND:
         s->state = 0;
-        ngx_str_set(&s->out, imap_invalid_command);
+        s->out.len = sizeof(imap_invalid_command) - 1;
+        s->out.data = imap_invalid_command;
         s->mail_state = ngx_imap_start;
         break;
     }
 
     if (tag) {
         if (s->tag.len == 0) {
-            ngx_str_set(&s->tag, imap_star);
+            s->tag.len = sizeof(imap_star) - 1;
+            s->tag.data = (u_char *) imap_star;
         }
 
         if (s->tagged_line.len < s->tag.len + s->text.len + s->out.len) {
             s->tagged_line.len = s->tag.len + s->text.len + s->out.len;
-            s->tagged_line.data = ngx_pnalloc(c->pool, s->tagged_line.len);
+            s->tagged_line.data = ngx_palloc(c->pool, s->tagged_line.len);
             if (s->tagged_line.data == NULL) {
                 ngx_mail_close_connection(c);
                 return;
@@ -279,21 +284,15 @@ ngx_mail_imap_auth_state(ngx_event_t *rev)
 
         if (s->state) {
             /* preserve tag */
-            s->arg_start = s->buffer->pos;
+            s->arg_start = s->buffer->start + s->tag.len;
+            s->buffer->pos = s->arg_start;
+            s->buffer->last = s->arg_start;
 
         } else {
-            if (s->buffer->pos == s->buffer->last) {
-                s->buffer->pos = s->buffer->start;
-                s->buffer->last = s->buffer->start;
-            }
-
+            s->buffer->pos = s->buffer->start;
+            s->buffer->last = s->buffer->start;
             s->tag.len = 0;
         }
-    }
-
-    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-        ngx_mail_session_internal_server_error(s);
-        return;
     }
 
     ngx_mail_send(c->write);
@@ -318,7 +317,7 @@ ngx_mail_imap_login(ngx_mail_session_t *s, ngx_connection_t *c)
     }
 
     s->login.len = arg[0].len;
-    s->login.data = ngx_pnalloc(c->pool, s->login.len);
+    s->login.data = ngx_palloc(c->pool, s->login.len);
     if (s->login.data == NULL) {
         return NGX_ERROR;
     }
@@ -326,7 +325,7 @@ ngx_mail_imap_login(ngx_mail_session_t *s, ngx_connection_t *c)
     ngx_memcpy(s->login.data, arg[0].data, s->login.len);
 
     s->passwd.len = arg[1].len;
-    s->passwd.data = ngx_pnalloc(c->pool, s->passwd.len);
+    s->passwd.data = ngx_palloc(c->pool, s->passwd.len);
     if (s->passwd.data == NULL) {
         return NGX_ERROR;
     }
@@ -359,34 +358,37 @@ ngx_mail_imap_authenticate(ngx_mail_session_t *s, ngx_connection_t *c)
     }
 #endif
 
-    iscf = ngx_mail_get_module_srv_conf(s, ngx_mail_imap_module);
-
     rc = ngx_mail_auth_parse(s, c);
 
     switch (rc) {
 
     case NGX_MAIL_AUTH_LOGIN:
 
-        ngx_str_set(&s->out, imap_username);
+        s->out.len = sizeof(imap_username) - 1;
+        s->out.data = imap_username;
         s->mail_state = ngx_imap_auth_login_username;
 
         return NGX_OK;
 
     case NGX_MAIL_AUTH_LOGIN_USERNAME:
 
-        ngx_str_set(&s->out, imap_password);
+        s->out.len = sizeof(imap_password) - 1;
+        s->out.data = imap_password;
         s->mail_state = ngx_imap_auth_login_password;
 
         return ngx_mail_auth_login_username(s, c, 1);
 
     case NGX_MAIL_AUTH_PLAIN:
 
-        ngx_str_set(&s->out, imap_plain_next);
+        s->out.len = sizeof(imap_plain_next) - 1;
+        s->out.data = imap_plain_next;
         s->mail_state = ngx_imap_auth_plain;
 
         return NGX_OK;
 
     case NGX_MAIL_AUTH_CRAM_MD5:
+
+        iscf = ngx_mail_get_module_srv_conf(s, ngx_mail_imap_module);
 
         if (!(iscf->auth_methods & NGX_MAIL_AUTH_CRAM_MD5_ENABLED)) {
             return NGX_MAIL_PARSE_INVALID_COMMAND;
@@ -406,17 +408,6 @@ ngx_mail_imap_authenticate(ngx_mail_session_t *s, ngx_connection_t *c)
         }
 
         return NGX_ERROR;
-
-    case NGX_MAIL_AUTH_EXTERNAL:
-
-        if (!(iscf->auth_methods & NGX_MAIL_AUTH_EXTERNAL_ENABLED)) {
-            return NGX_MAIL_PARSE_INVALID_COMMAND;
-        }
-
-        ngx_str_set(&s->out, imap_username);
-        s->mail_state = ngx_imap_auth_external;
-
-        return NGX_OK;
     }
 
     return rc;
@@ -464,8 +455,6 @@ ngx_mail_imap_starttls(ngx_mail_session_t *s, ngx_connection_t *c)
     if (c->ssl == NULL) {
         sslcf = ngx_mail_get_module_srv_conf(s, ngx_mail_ssl_module);
         if (sslcf->starttls) {
-            s->buffer->pos = s->buffer->start;
-            s->buffer->last = s->buffer->start;
             c->read->handler = ngx_mail_starttls_handler;
             return NGX_OK;
         }
